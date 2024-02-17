@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 - 2023 Elytrium
+ * Copyright (C) 2021 - 2024 Elytrium
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -32,6 +32,7 @@ import com.velocitypowered.natives.compression.VelocityCompressor;
 import com.velocitypowered.natives.util.Natives;
 import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
+import com.velocitypowered.proxy.connection.MinecraftSessionHandler;
 import com.velocitypowered.proxy.connection.client.ConnectedPlayer;
 import com.velocitypowered.proxy.event.VelocityEventManager;
 import com.velocitypowered.proxy.network.Connections;
@@ -61,6 +62,7 @@ import net.elytrium.commons.kyori.serialization.Serializers;
 import net.elytrium.commons.utils.reflection.ReflectionException;
 import net.elytrium.commons.utils.updates.UpdatesChecker;
 import net.elytrium.fastprepare.PreparedPacketFactory;
+import net.elytrium.fastprepare.handler.PreparedPacketEncoder;
 import net.elytrium.limboapi.api.Limbo;
 import net.elytrium.limboapi.api.LimboFactory;
 import net.elytrium.limboapi.api.chunk.BuiltInBiome;
@@ -80,7 +82,6 @@ import net.elytrium.limboapi.api.protocol.packets.PacketFactory;
 import net.elytrium.limboapi.file.WorldFileTypeRegistry;
 import net.elytrium.limboapi.injection.disconnect.DisconnectListener;
 import net.elytrium.limboapi.injection.event.EventManagerHook;
-import net.elytrium.limboapi.injection.kick.KickListener;
 import net.elytrium.limboapi.injection.login.LoginListener;
 import net.elytrium.limboapi.injection.login.LoginTasksQueue;
 import net.elytrium.limboapi.injection.packet.LegacyPlayerListItemHook;
@@ -198,7 +199,7 @@ public class LimboAPI implements LimboFactory {
     if (Settings.IMP.reload(this.configFile, Settings.IMP.PREFIX) == YamlConfig.LoadResult.CONFIG_NOT_EXISTS) {
       LOGGER.warn("************* FIRST LAUNCH *************");
       LOGGER.warn("Thanks for installing LimboAPI!");
-      LOGGER.warn("(C) 2021 - 2023 Elytrium");
+      LOGGER.warn("(C) 2021 - 2024 Elytrium");
       LOGGER.warn("");
       LOGGER.warn("Check out our plugins here: https://ely.su/github <3");
       LOGGER.warn("Discord: https://ely.su/discord");
@@ -281,7 +282,6 @@ public class LimboAPI implements LimboFactory {
     VelocityEventManager eventManager = this.server.getEventManager();
     eventManager.unregisterListeners(this);
     eventManager.register(this, this.loginListener);
-    eventManager.register(this, new KickListener(this));
     eventManager.register(this, new DisconnectListener(this));
     eventManager.register(this, new ReloadListener(this));
 
@@ -414,7 +414,40 @@ public class LimboAPI implements LimboFactory {
   }
 
   public void inject3rdParty(Player player, MinecraftConnection connection, ChannelPipeline pipeline) {
-    this.preparedPacketFactory.inject(player, connection, pipeline);
+    StateRegistry state = connection.getState();
+    if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) < 0
+        || (state != StateRegistry.CONFIG && state != StateRegistry.LOGIN)) {
+      this.preparedPacketFactory.inject(player, connection, pipeline);
+    } else {
+      this.configPreparedPacketFactory.inject(player, connection, pipeline);
+    }
+  }
+
+  public void setState(MinecraftConnection connection, StateRegistry stateRegistry) {
+    connection.setState(stateRegistry);
+    this.setEncoderState(connection, stateRegistry);
+  }
+
+  public void setActiveSessionHandler(MinecraftConnection connection, StateRegistry stateRegistry,
+                                      MinecraftSessionHandler sessionHandler) {
+    connection.setActiveSessionHandler(stateRegistry, sessionHandler);
+    this.setEncoderState(connection, stateRegistry);
+  }
+
+  public void setEncoderState(MinecraftConnection connection, StateRegistry state) {
+    // As CONFIG state was added in 1.20.2, no need to track it for lower versions
+    if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) < 0) {
+      return;
+    }
+
+    PreparedPacketEncoder encoder = connection.getChannel().pipeline().get(PreparedPacketEncoder.class);
+    if (encoder != null) {
+      if (state != StateRegistry.CONFIG && state != StateRegistry.LOGIN) {
+        encoder.setFactory(this.preparedPacketFactory);
+      } else {
+        encoder.setFactory(this.configPreparedPacketFactory);
+      }
+    }
   }
 
   public void deject3rdParty(ChannelPipeline pipeline) {

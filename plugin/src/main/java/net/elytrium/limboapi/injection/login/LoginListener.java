@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 - 2023 Elytrium
+ * Copyright (C) 2021 - 2024 Elytrium
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -54,11 +54,12 @@ import com.velocitypowered.proxy.connection.client.ClientPlaySessionHandler;
 import com.velocitypowered.proxy.connection.client.ConnectedPlayer;
 import com.velocitypowered.proxy.connection.client.InitialInboundConnection;
 import com.velocitypowered.proxy.connection.client.LoginInboundConnection;
+import com.velocitypowered.proxy.crypto.IdentifiedKeyImpl;
 import com.velocitypowered.proxy.network.Connections;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.VelocityConnectionEvent;
-import com.velocitypowered.proxy.protocol.packet.ServerLoginSuccess;
-import com.velocitypowered.proxy.protocol.packet.SetCompression;
+import com.velocitypowered.proxy.protocol.packet.ServerLoginSuccessPacket;
+import com.velocitypowered.proxy.protocol.packet.SetCompressionPacket;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPipeline;
@@ -69,6 +70,7 @@ import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import net.elytrium.commons.utils.reflection.ReflectionException;
 import net.elytrium.limboapi.LimboAPI;
@@ -76,7 +78,6 @@ import net.elytrium.limboapi.api.event.LoginLimboRegisterEvent;
 import net.elytrium.limboapi.injection.dummy.ClosedChannel;
 import net.elytrium.limboapi.injection.dummy.ClosedMinecraftConnection;
 import net.elytrium.limboapi.injection.dummy.DummyEventPool;
-import net.elytrium.limboapi.injection.login.confirmation.ConfirmHandler;
 import net.elytrium.limboapi.injection.login.confirmation.LoginConfirmHandler;
 import net.elytrium.limboapi.injection.packet.ServerLoginSuccessHook;
 import net.kyori.adventure.text.Component;
@@ -136,13 +137,27 @@ public class LoginListener {
       MC_CONNECTION_FIELD.set(handler, CLOSED_MINECRAFT_CONNECTION);
 
       if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
-        connection.setActiveSessionHandler(StateRegistry.LOGIN, new LoginConfirmHandler(connection));
+        connection.setActiveSessionHandler(StateRegistry.LOGIN, new LoginConfirmHandler(this.plugin, connection));
       }
 
       // From Velocity.
       if (!connection.isClosed()) {
         connection.eventLoop().execute(() -> {
           try {
+            IdentifiedKey playerKey = inboundConnection.getIdentifiedKey();
+            if (playerKey != null) {
+              if (playerKey.getSignatureHolder() == null) {
+                if (playerKey instanceof IdentifiedKeyImpl unlinkedKey) {
+                  // Failsafe
+                  if (!unlinkedKey.internalAddHolder(event.getGameProfile().getId())) {
+                    playerKey = null;
+                  }
+                }
+              } else if (!Objects.equals(playerKey.getSignatureHolder(), event.getGameProfile().getId())) {
+                playerKey = null;
+              }
+            }
+
             // Initiate a regular connection and move over to it.
             ConnectedPlayer player = (ConnectedPlayer) CONNECTED_PLAYER_CONSTRUCTOR.invokeExact(
                 this.server,
@@ -150,10 +165,10 @@ public class LoginListener {
                 connection,
                 inboundConnection.getVirtualHost().orElse(null),
                 this.onlineMode.contains(event.getUsername()),
-                inboundConnection.getIdentifiedKey()
+                playerKey
             );
             if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
-              ((ConfirmHandler) connection.getActiveSessionHandler()).setPlayer(player);
+              ((LoginConfirmHandler) connection.getActiveSessionHandler()).setPlayer(player);
             }
             if (this.server.canRegisterConnection(player)) {
               if (!connection.isClosed()) {
@@ -162,7 +177,7 @@ public class LoginListener {
                 ChannelPipeline pipeline = connection.getChannel().pipeline();
                 boolean compressionEnabled = threshold >= 0 && connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_8) >= 0;
                 if (compressionEnabled) {
-                  connection.write(new SetCompression(threshold));
+                  connection.write(new SetCompressionPacket(threshold));
                   this.plugin.fixDecompressor(pipeline, threshold, true);
                   pipeline.addFirst(Connections.COMPRESSION_ENCODER, new ChannelOutboundHandlerAdapter());
                 }
@@ -185,7 +200,7 @@ public class LoginListener {
                 successHook.setUuid(playerUniqueID);
                 connection.write(successHook);
 
-                ServerLoginSuccess success = new ServerLoginSuccess();
+                ServerLoginSuccessPacket success = new ServerLoginSuccessPacket();
                 success.setUsername(player.getUsername());
                 success.setProperties(player.getGameProfileProperties());
                 success.setUuid(playerUniqueID);
@@ -204,19 +219,13 @@ public class LoginListener {
 
                 this.plugin.setInitialID(player, playerUniqueID);
 
-                if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) < 0) {
+                if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
+                  ((LoginConfirmHandler) connection.getActiveSessionHandler())
+                      .thenRun(() -> this.fireRegisterEvent(player, connection, inbound, handler));
+                } else {
                   connection.setState(StateRegistry.PLAY);
+                  this.fireRegisterEvent(player, connection, inbound, handler);
                 }
-
-                this.server.getEventManager().fire(new LoginLimboRegisterEvent(player)).thenAcceptAsync(limboRegisterEvent -> {
-                  LoginTasksQueue queue = new LoginTasksQueue(this.plugin, handler, this.server, player, inbound, limboRegisterEvent.getOnJoinCallbacks());
-                  this.plugin.addLoginQueue(player, queue);
-                  this.plugin.setKickCallback(player, limboRegisterEvent.getOnKickCallback());
-                  queue.next();
-                }, connection.eventLoop()).exceptionally(t -> {
-                  LimboAPI.getLogger().error("Exception while registering LimboAPI login handlers for {}.", player, t);
-                  return null;
-                });
               }
             } else {
               player.disconnect0(Component.translatable("velocity.error.already-connected-proxy", NamedTextColor.RED), true);
@@ -229,10 +238,28 @@ public class LoginListener {
     }
   }
 
+  private void fireRegisterEvent(ConnectedPlayer player, MinecraftConnection connection,
+      InitialInboundConnection inbound, Object handler) {
+    this.server.getEventManager().fire(new LoginLimboRegisterEvent(player)).thenAcceptAsync(limboRegisterEvent -> {
+      LoginTasksQueue queue = new LoginTasksQueue(this.plugin, handler, this.server, player, inbound, limboRegisterEvent.getOnJoinCallbacks());
+      this.plugin.addLoginQueue(player, queue);
+      this.plugin.setKickCallback(player, limboRegisterEvent.getOnKickCallback());
+      queue.next();
+    }, connection.eventLoop()).exceptionally(t -> {
+      LimboAPI.getLogger().error("Exception while registering LimboAPI login handlers for {}.", player, t);
+      return null;
+    });
+  }
+
   @Subscribe
   public void hookPlaySession(ServerConnectedEvent event) {
     ConnectedPlayer player = (ConnectedPlayer) event.getPlayer();
     MinecraftConnection connection = player.getConnection();
+
+    // 1.20.2+ can ignore this, as it should be despawned by default
+    if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
+      return;
+    }
 
     connection.eventLoop().execute(() -> {
       if (!(connection.getActiveSessionHandler() instanceof ClientPlaySessionHandler)) {

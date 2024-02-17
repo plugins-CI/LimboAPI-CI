@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 - 2023 Elytrium
+ * Copyright (C) 2021 - 2024 Elytrium
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -18,7 +18,8 @@
 package net.elytrium.limboapi.server;
 
 import com.velocitypowered.api.network.ProtocolVersion;
-import com.velocitypowered.proxy.protocol.packet.Disconnect;
+import com.velocitypowered.proxy.protocol.StateRegistry;
+import com.velocitypowered.proxy.protocol.packet.DisconnectPacket;
 import net.elytrium.limboapi.LimboAPI;
 import net.elytrium.limboapi.Settings;
 import net.elytrium.limboapi.api.protocol.PreparedPacket;
@@ -29,7 +30,9 @@ public class CachedPackets {
 
   private PreparedPacket tooBigPacket;
   private PreparedPacket invalidPing;
-  private PreparedPacket timeOut;
+  private PreparedPacket invalidSwitch;
+  private PreparedPacket playTimeOut;
+  private PreparedPacket configTimeOut;
   private boolean cached;
 
   public CachedPackets(LimboAPI plugin) {
@@ -45,14 +48,18 @@ public class CachedPackets {
         .prepare(version -> this.createDisconnectPacket(Settings.IMP.MAIN.MESSAGES.TOO_BIG_PACKET, version)).build();
     this.invalidPing = this.plugin.createPreparedPacket()
         .prepare(version -> this.createDisconnectPacket(Settings.IMP.MAIN.MESSAGES.INVALID_PING, version)).build();
-    this.timeOut = this.plugin.createPreparedPacket()
+    this.invalidSwitch = this.plugin.createConfigPreparedPacket()
+        .prepare(version -> this.createDisconnectPacket(Settings.IMP.MAIN.MESSAGES.INVALID_SWITCH, version), ProtocolVersion.MINECRAFT_1_20_2).build();
+    this.playTimeOut = this.plugin.createPreparedPacket()
         .prepare(version -> this.createDisconnectPacket(Settings.IMP.MAIN.MESSAGES.TIME_OUT, version)).build();
+    this.configTimeOut = this.plugin.createConfigPreparedPacket()
+        .prepare(version -> this.createDisconnectPacket(Settings.IMP.MAIN.MESSAGES.TIME_OUT, version), ProtocolVersion.MINECRAFT_1_20_2).build();
 
     this.cached = true;
   }
 
-  private Disconnect createDisconnectPacket(String message, ProtocolVersion version) {
-    return Disconnect.create(LimboAPI.getSerializer().deserialize(message), version, false);
+  private DisconnectPacket createDisconnectPacket(String message, ProtocolVersion version) {
+    return DisconnectPacket.create(LimboAPI.getSerializer().deserialize(message), version, StateRegistry.PLAY);
   }
 
   public PreparedPacket getTooBigPacket() {
@@ -63,13 +70,23 @@ public class CachedPackets {
     return this.invalidPing;
   }
 
-  public PreparedPacket getTimeOut() {
-    return this.timeOut;
+  public PreparedPacket getInvalidSwitch() {
+    return this.invalidSwitch;
+  }
+
+  public PreparedPacket getTimeOut(StateRegistry stateRegistry) {
+    if (stateRegistry == StateRegistry.CONFIG) {
+      return this.configTimeOut;
+    }
+
+    return this.playTimeOut;
   }
 
   public void dispose() {
     this.tooBigPacket.release();
     this.invalidPing.release();
-    this.timeOut.release();
+    this.invalidSwitch.release();
+    this.playTimeOut.release();
+    this.configTimeOut.release();
   }
 }

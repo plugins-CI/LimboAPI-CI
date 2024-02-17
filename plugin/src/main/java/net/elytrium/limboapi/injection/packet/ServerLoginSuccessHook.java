@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 - 2023 Elytrium
+ * Copyright (C) 2021 - 2024 Elytrium
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -17,8 +17,8 @@
 
 package net.elytrium.limboapi.injection.packet;
 
-import com.velocitypowered.proxy.protocol.packet.ServerLoginSuccess;
+import com.velocitypowered.proxy.protocol.packet.ServerLoginSuccessPacket;
 import net.elytrium.fastprepare.dummy.DummyPacket;
 
-public class ServerLoginSuccessHook extends ServerLoginSuccess implements DummyPacket {
+public class ServerLoginSuccessHook extends ServerLoginSuccessPacket implements DummyPacket {
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 - 2023 Elytrium
+ * Copyright (C) 2021 - 2024 Elytrium
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -39,11 +39,11 @@ import com.velocitypowered.api.event.connection.LoginEvent;
 import com.velocitypowered.api.event.connection.PostLoginEvent;
 import com.velocitypowered.api.event.permission.PermissionsSetupEvent;
 import com.velocitypowered.api.event.player.GameProfileRequestEvent;
+import com.velocitypowered.api.event.player.PlayerClientBrandEvent;
 import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.api.permission.PermissionFunction;
 import com.velocitypowered.api.permission.PermissionProvider;
 import com.velocitypowered.api.proxy.InboundConnection;
-import com.velocitypowered.api.proxy.crypto.IdentifiedKey;
 import com.velocitypowered.api.util.GameProfile;
 import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
@@ -51,13 +51,11 @@ import com.velocitypowered.proxy.connection.client.AuthSessionHandler;
 import com.velocitypowered.proxy.connection.client.ClientConfigSessionHandler;
 import com.velocitypowered.proxy.connection.client.ConnectedPlayer;
 import com.velocitypowered.proxy.connection.client.InitialConnectSessionHandler;
-import com.velocitypowered.proxy.crypto.IdentifiedKeyImpl;
 import com.velocitypowered.proxy.network.Connections;
 import com.velocitypowered.proxy.protocol.StateRegistry;
-import com.velocitypowered.proxy.protocol.packet.LegacyPlayerListItem;
-import com.velocitypowered.proxy.protocol.packet.UpsertPlayerInfo;
+import com.velocitypowered.proxy.protocol.packet.LegacyPlayerListItemPacket;
+import com.velocitypowered.proxy.protocol.packet.UpsertPlayerInfoPacket;
 import com.velocitypowered.proxy.protocol.packet.chat.ComponentHolder;
-import com.velocitypowered.proxy.protocol.packet.config.StartUpdate;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventLoop;
@@ -74,8 +72,8 @@ import java.util.concurrent.CompletableFuture;
 import net.elytrium.commons.utils.reflection.ReflectionException;
 import net.elytrium.limboapi.LimboAPI;
 import net.elytrium.limboapi.injection.event.EventManagerHook;
-import net.elytrium.limboapi.injection.login.confirmation.ConfirmHandler;
-import net.elytrium.limboapi.injection.login.confirmation.TransitionConfirmHandler;
+import net.elytrium.limboapi.injection.login.confirmation.LoginConfirmHandler;
+import net.elytrium.limboapi.server.LimboSessionHandlerImpl;
 import net.kyori.adventure.text.Component;
 import org.slf4j.Logger;
 
@@ -87,9 +85,10 @@ public class LoginTasksQueue {
   private static final MethodHandle INITIAL_CONNECT_SESSION_HANDLER_CONSTRUCTOR;
   private static final Field MC_CONNECTION_FIELD;
   private static final MethodHandle CONNECT_TO_INITIAL_SERVER_METHOD;
-  private static final MethodHandle PLAYER_KEY_FIELD;
   private static final Field LOGIN_STATE_FIELD;
   private static final Field CONNECTED_PLAYER_FIELD;
+  private static final MethodHandle SET_CLIENT_BRAND;
+  private static final Field BRAND_CHANNEL;
 
   private final LimboAPI plugin;
   private final Object handler;
@@ -133,28 +132,28 @@ public class LoginTasksQueue {
         gameProfile -> {
           try {
             if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_19_1) <= 0) {
-              connection.delayedWrite(new LegacyPlayerListItem(
-                  LegacyPlayerListItem.REMOVE_PLAYER,
-                  List.of(new LegacyPlayerListItem.Item(this.player.getUniqueId()))
+              connection.delayedWrite(new LegacyPlayerListItemPacket(
+                  LegacyPlayerListItemPacket.REMOVE_PLAYER,
+                  List.of(new LegacyPlayerListItemPacket.Item(this.player.getUniqueId()))
               ));
 
-              connection.delayedWrite(new LegacyPlayerListItem(
-                  LegacyPlayerListItem.ADD_PLAYER,
+              connection.delayedWrite(new LegacyPlayerListItemPacket(
+                  LegacyPlayerListItemPacket.ADD_PLAYER,
                   List.of(
-                      new LegacyPlayerListItem.Item(this.player.getUniqueId())
+                      new LegacyPlayerListItemPacket.Item(this.player.getUniqueId())
                           .setName(gameProfile.getUsername())
                           .setProperties(gameProfile.getGameProfile().getProperties())
                   )
               ));
-            } else if (connection.getState() == StateRegistry.PLAY) {
-              UpsertPlayerInfo.Entry playerInfoEntry = new UpsertPlayerInfo.Entry(this.player.getUniqueId());
+            } else if (connection.getState() != StateRegistry.CONFIG) {
+              UpsertPlayerInfoPacket.Entry playerInfoEntry = new UpsertPlayerInfoPacket.Entry(this.player.getUniqueId());
               playerInfoEntry.setDisplayName(new ComponentHolder(this.player.getProtocolVersion(), Component.text(gameProfile.getUsername())));
               playerInfoEntry.setProfile(gameProfile.getGameProfile());
 
-              connection.delayedWrite(new UpsertPlayerInfo(
+              connection.delayedWrite(new UpsertPlayerInfoPacket(
                   EnumSet.of(
-                      UpsertPlayerInfo.Action.UPDATE_DISPLAY_NAME,
-                      UpsertPlayerInfo.Action.ADD_PLAYER),
+                      UpsertPlayerInfoPacket.Action.UPDATE_DISPLAY_NAME,
+                      UpsertPlayerInfoPacket.Action.ADD_PLAYER),
                   List.of(playerInfoEntry)));
             }
 
@@ -200,8 +199,8 @@ public class LoginTasksQueue {
   private void initialize(MinecraftConnection connection) throws Throwable {
     connection.setAssociation(this.player);
     if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) < 0
-        || (connection.getState() != StateRegistry.LOGIN && connection.getState() != StateRegistry.CONFIG)) {
-      connection.setState(StateRegistry.PLAY);
+        || connection.getState() != StateRegistry.CONFIG) {
+      this.plugin.setState(connection, StateRegistry.PLAY);
     }
 
     ChannelPipeline pipeline = connection.getChannel().pipeline();
@@ -209,22 +208,6 @@ public class LoginTasksQueue {
 
     if (pipeline.get(Connections.FRAME_ENCODER) == null) {
       this.plugin.fixCompressor(pipeline, connection.getProtocolVersion());
-    }
-
-    if (this.player.getIdentifiedKey() != null) {
-      IdentifiedKey playerKey = this.player.getIdentifiedKey();
-      if (playerKey.getSignatureHolder() == null) {
-        if (playerKey instanceof IdentifiedKeyImpl unlinkedKey) {
-          // Failsafe
-          if (!unlinkedKey.internalAddHolder(this.player.getUniqueId())) {
-            PLAYER_KEY_FIELD.invokeExact(this.player, (IdentifiedKey) null);
-          }
-        }
-      } else {
-        if (!Objects.equals(playerKey.getSignatureHolder(), this.player.getUniqueId())) {
-          PLAYER_KEY_FIELD.invokeExact(this.player, (IdentifiedKey) null);
-        }
-      }
     }
 
     Logger logger = LimboAPI.getLogger();
@@ -235,16 +218,16 @@ public class LoginTasksQueue {
       } else {
         Optional<Component> reason = event.getResult().getReasonComponent();
         if (reason.isPresent()) {
-          this.player.disconnect0(reason.get(), true);
+          this.player.disconnect0(reason.get(), false);
         } else {
           if (this.server.registerConnection(this.player)) {
-            if (connection.getActiveSessionHandler() instanceof ConfirmHandler confirm) {
+            if (connection.getActiveSessionHandler() instanceof LoginConfirmHandler confirm) {
               confirm.waitForConfirmation(() -> this.connectToServer(logger, this.player, connection));
             } else {
               this.connectToServer(logger, this.player, connection);
             }
           } else {
-            this.player.disconnect0(Component.translatable("velocity.error.already-connected-proxy"), true);
+            this.player.disconnect0(Component.translatable("velocity.error.already-connected-proxy"), false);
           }
         }
       }
@@ -254,6 +237,7 @@ public class LoginTasksQueue {
     });
   }
 
+  @SuppressFBWarnings("NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE")
   private void connectToServer(Logger logger, ConnectedPlayer player, MinecraftConnection connection) {
     if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) < 0) {
       try {
@@ -262,21 +246,35 @@ public class LoginTasksQueue {
       } catch (Throwable e) {
         throw new ReflectionException(e);
       }
+    } else if (connection.getState() == StateRegistry.PLAY) {
+      // Synchronize with the client to ensure that it will not corrupt CONFIG state with PLAY packets
+      ((LimboSessionHandlerImpl) connection.getActiveSessionHandler())
+          .disconnectToConfig(() -> this.connectToServer(logger, player, connection));
+
+      return; // Re-running this method due to synchronization with the client
     } else {
-      if (connection.getState() == StateRegistry.PLAY) {
-        connection.write(new StartUpdate());
+      ClientConfigSessionHandler configHandler = new ClientConfigSessionHandler(this.server, this.player);
 
-        TransitionConfirmHandler confirm = new TransitionConfirmHandler(connection);
-        confirm.setPlayer(player);
+      // 1.20.2+ client doesn't send ClientSettings and brand while switching state,
+      // so we need to use packets that was sent during LOGIN completion.
+      if (connection.getActiveSessionHandler() instanceof LimboSessionHandlerImpl sessionHandler) {
+        if (sessionHandler.getSettings() != null) {
+          this.player.setClientSettings(sessionHandler.getSettings());
+        }
 
-        connection.setActiveSessionHandler(StateRegistry.PLAY, confirm);
-        confirm.waitForConfirmation(() -> this.connectToServer(logger, player, connection));
-
-        return;
+        // TODO: also queue non-vanilla plugin messages?
+        if (sessionHandler.getBrand() != null) {
+          try {
+            this.server.getEventManager().fireAndForget(new PlayerClientBrandEvent(this.player, sessionHandler.getBrand()));
+            SET_CLIENT_BRAND.invokeExact(this.player, sessionHandler.getBrand());
+            BRAND_CHANNEL.set(configHandler, "minecraft:brand");
+          } catch (Throwable e) {
+            throw new ReflectionException(e);
+          }
+        }
       }
 
-      connection.setActiveSessionHandler(StateRegistry.CONFIG,
-          new ClientConfigSessionHandler(this.server, this.player));
+      this.plugin.setActiveSessionHandler(connection, StateRegistry.CONFIG, configHandler);
     }
 
     this.server.getEventManager().fire(new PostLoginEvent(this.player)).thenAccept(postLoginEvent -> {
@@ -315,8 +313,11 @@ public class LoginTasksQueue {
       MC_CONNECTION_FIELD = AuthSessionHandler.class.getDeclaredField("mcConnection");
       MC_CONNECTION_FIELD.setAccessible(true);
 
-      PLAYER_KEY_FIELD = MethodHandles.privateLookupIn(ConnectedPlayer.class, MethodHandles.lookup())
-          .findSetter(ConnectedPlayer.class, "playerKey", IdentifiedKey.class);
+      SET_CLIENT_BRAND = MethodHandles.privateLookupIn(ConnectedPlayer.class, MethodHandles.lookup())
+          .findVirtual(ConnectedPlayer.class, "setClientBrand", MethodType.methodType(void.class, String.class));
+
+      BRAND_CHANNEL = ClientConfigSessionHandler.class.getDeclaredField("brandChannel");
+      BRAND_CHANNEL.setAccessible(true);
     } catch (NoSuchFieldException | NoSuchMethodException | IllegalAccessException e) {
       throw new ReflectionException(e);
     }

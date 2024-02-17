@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 - 2023 Elytrium
+ * Copyright (C) 2021 - 2024 Elytrium
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -21,10 +21,11 @@ import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
+import com.velocitypowered.proxy.connection.client.ClientConfigSessionHandler;
 import com.velocitypowered.proxy.connection.client.ConnectedPlayer;
 import com.velocitypowered.proxy.protocol.StateRegistry;
-import com.velocitypowered.proxy.protocol.packet.LegacyPlayerListItem;
-import com.velocitypowered.proxy.protocol.packet.UpsertPlayerInfo;
+import com.velocitypowered.proxy.protocol.packet.LegacyPlayerListItemPacket;
+import com.velocitypowered.proxy.protocol.packet.UpsertPlayerInfoPacket;
 import java.awt.Graphics2D;
 import java.awt.Image;
 import java.awt.image.BufferedImage;
@@ -195,17 +196,17 @@ public class LimboPlayerImpl implements LimboPlayer {
       if (!is17) {
         if (this.connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_19_1) <= 0) {
           this.writePacket(
-              new LegacyPlayerListItem(LegacyPlayerListItem.UPDATE_GAMEMODE,
+              new LegacyPlayerListItemPacket(LegacyPlayerListItemPacket.UPDATE_GAMEMODE,
                   List.of(
-                      new LegacyPlayerListItem.Item(this.player.getUniqueId()).setGameMode(id)
+                      new LegacyPlayerListItemPacket.Item(this.player.getUniqueId()).setGameMode(id)
                   )
               )
           );
         } else {
-          UpsertPlayerInfo.Entry playerInfoEntry = new UpsertPlayerInfo.Entry(this.player.getUniqueId());
+          UpsertPlayerInfoPacket.Entry playerInfoEntry = new UpsertPlayerInfoPacket.Entry(this.player.getUniqueId());
           playerInfoEntry.setGameMode(id);
 
-          this.writePacket(new UpsertPlayerInfo(EnumSet.of(UpsertPlayerInfo.Action.UPDATE_GAME_MODE), List.of(playerInfoEntry)));
+          this.writePacket(new UpsertPlayerInfoPacket(EnumSet.of(UpsertPlayerInfoPacket.Action.UPDATE_GAME_MODE), List.of(playerInfoEntry)));
         }
       }
       this.writePacket(new ChangeGameStatePacket(3, id));
@@ -233,15 +234,17 @@ public class LimboPlayerImpl implements LimboPlayer {
   public void disconnect() {
     this.connection.eventLoop().execute(() -> {
       if (this.connection.getActiveSessionHandler() == this.sessionHandler) {
-        this.sessionHandler.switchDisconnection(() -> {
+        this.sessionHandler.disconnect(() -> {
           if (this.plugin.hasLoginQueue(this.player)) {
-            this.sessionHandler.disconnected();
-            this.plugin.getLoginQueue(this.player).next();
+            if (this.connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
+              this.sessionHandler.disconnectToConfig(() -> this.plugin.getLoginQueue(this.player).next());
+            } else {
+              this.sessionHandler.disconnected();
+              this.plugin.getLoginQueue(this.player).next();
+            }
           } else {
             RegisteredServer server = this.sessionHandler.getPreviousServer();
             if (server != null) {
-              this.deject();
-              this.sessionHandler.disconnected();
               this.sendToRegisteredServer(server);
             } else {
               this.sessionHandler.disconnected();
@@ -256,14 +259,19 @@ public class LimboPlayerImpl implements LimboPlayer {
   public void disconnect(RegisteredServer server) {
     this.connection.eventLoop().execute(() -> {
       if (this.connection.getActiveSessionHandler() == this.sessionHandler) {
-        this.sessionHandler.switchDisconnection(() -> {
+        this.sessionHandler.disconnect(() -> {
           if (this.plugin.hasLoginQueue(this.player)) {
-            this.sessionHandler.disconnected();
-            this.plugin.setNextServer(this.player, server);
-            this.plugin.getLoginQueue(this.player).next();
+            if (this.connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
+              this.sessionHandler.disconnectToConfig(() -> {
+                this.plugin.setNextServer(this.player, server);
+                this.plugin.getLoginQueue(this.player).next();
+              });
+            } else {
+              this.sessionHandler.disconnected();
+              this.plugin.setNextServer(this.player, server);
+              this.plugin.getLoginQueue(this.player).next();
+            }
           } else {
-            this.deject();
-            this.sessionHandler.disconnected();
             this.sendToRegisteredServer(server);
           }
         });
@@ -277,10 +285,27 @@ public class LimboPlayerImpl implements LimboPlayer {
   }
 
   private void sendToRegisteredServer(RegisteredServer server) {
-    this.connection.eventLoop().execute(() -> {
-      this.connection.setState(StateRegistry.PLAY);
+    this.deject();
+    this.connection.setState(StateRegistry.PLAY);
+
+    if (this.connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
+      this.sessionHandler.disconnectToConfig(() -> {
+        // Rollback original CONFIG handler
+        this.connection.setActiveSessionHandler(StateRegistry.CONFIG,
+            new ClientConfigSessionHandler(this.plugin.getServer(), this.player));
+        this.player.createConnectionRequest(server).fireAndForget();
+      });
+    } else {
+      if (this.connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_19_1) <= 0) {
+        this.connection.delayedWrite(new LegacyPlayerListItemPacket(
+            LegacyPlayerListItemPacket.REMOVE_PLAYER,
+            List.of(new LegacyPlayerListItemPacket.Item(this.player.getUniqueId()))
+        ));
+      }
+
+      this.sessionHandler.disconnected();
       this.player.createConnectionRequest(server).fireAndForget();
-    });
+    }
   }
 
   @Override
